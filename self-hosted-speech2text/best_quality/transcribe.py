@@ -2,6 +2,7 @@
 """
 Best-quality speech-to-text using faster-whisper large-v3 on CPU.
 Press SPACE to start recording, press SPACE/ESC/d to stop.
+Transcription runs in the background so you can keep recording.
 Result goes to: terminal, clipboard (xclip), and dated file.
 """
 
@@ -10,51 +11,123 @@ import os
 import time
 import wave
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-# Add parent dir so we can import shared code
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stt_common import (get_key_nonblocking, record_audio, copy_to_clipboard,
-                         save_to_file, SAMPLE_RATE, CHANNELS)
+                         save_to_file, prompt_filename, cprint, queue_print,
+                         drain_output, has_pending_output,
+                         SAMPLE_RATE, CHANNELS,
+                         C_GREEN, C_YELLOW, C_RED, C_CYAN, C_DIM, C_TGREEN)
 
 MODEL_SIZE = "large-v3"
 COMPUTE_TYPE = "int8"
 
+_pending = 0
+_pending_lock = threading.Lock()
+
+
+def _adjust_pending(delta):
+    global _pending
+    with _pending_lock:
+        _pending += delta
+        return _pending
+
+
+def _get_pending():
+    with _pending_lock:
+        return _pending
+
+
+def _show_ready():
+    """Print the ready prompt, including pending count if any."""
+    n = _get_pending()
+    if n > 0:
+        cprint(f"Ready. Press SPACE to record...  [{n} transcribing]", C_GREEN)
+    else:
+        cprint("Ready. Press SPACE to record...", C_GREEN)
+
+
+def _transcribe_job(model, wav_path, duration, filepath):
+    """Runs in a background thread: transcribe, save, queue output."""
+    try:
+        t0 = time.time()
+        segments, info = model.transcribe(wav_path, language='en',
+                                           beam_size=5, best_of=5,
+                                           vad_filter=True)
+        text_parts = [seg.text.strip() for seg in segments]
+        text = ' '.join(text_parts)
+        elapsed = time.time() - t0
+
+        os.unlink(wav_path)
+
+        if not text.strip():
+            queue_print("(no speech detected)", C_DIM, indent=True)
+            return
+
+        queue_print(f"=== TRANSCRIPTION ({elapsed:.1f}s, {duration:.1f}s audio) ===", C_TGREEN, indent=True)
+        queue_print(text, C_TGREEN, indent=True)
+        queue_print("=" * 50, C_TGREEN, indent=True)
+
+        copy_to_clipboard(text)
+        queue_print("Copied to clipboard.", C_DIM, indent=True)
+
+        save_to_file(text, filepath)
+        queue_print(f"Saved to {filepath}", C_DIM, indent=True)
+    finally:
+        _adjust_pending(-1)
+
 
 def main():
-    print(f"Loading faster-whisper {MODEL_SIZE} ({COMPUTE_TYPE})...")
+    cprint(f"Loading faster-whisper {MODEL_SIZE} ({COMPUTE_TYPE})...", C_DIM)
     t0 = time.time()
     from faster_whisper import WhisperModel
     model = WhisperModel(MODEL_SIZE, device='cpu', compute_type=COMPUTE_TYPE,
                          cpu_threads=os.cpu_count())
-    print(f"  Model loaded in {time.time()-t0:.1f}s\n")
+    cprint(f"Model loaded in {time.time()-t0:.1f}s", C_DIM, indent=True)
+    print()
 
-    print("=" * 55)
-    print("  BEST QUALITY MODE (large-v3, slower than realtime)")
-    print("  Press SPACE to start recording")
-    print("  Press SPACE/d/ESC to stop recording")
-    print("  Press Ctrl+C or 'q' (when idle) to quit")
-    print("=" * 55)
+    cprint("=" * 55, C_CYAN)
+    cprint("  BEST QUALITY MODE (large-v3, slower than realtime)", C_CYAN)
+    cprint("  Press SPACE to start recording", C_CYAN)
+    cprint("  Press SPACE/d/ESC to stop recording", C_CYAN)
+    cprint("  Press Ctrl+C or 'q' (when idle) to quit", C_CYAN)
+    cprint("=" * 55, C_CYAN)
+
+    executor = ThreadPoolExecutor(max_workers=1)
 
     while True:
-        print("\nReady. Press SPACE to record...")
+        # Drain any completed background output, then show ready prompt
+        print()
+        drain_output()
+        _show_ready()
+
+        # Idle loop: wait for SPACE, draining background output as it arrives
         while True:
             key = get_key_nonblocking(0.1)
             if key == ' ':
                 break
             if key in ('q', 'Q') or key == '\x03':
-                print("\nBye!")
+                executor.shutdown(wait=True)
+                drain_output()
+                cprint("Bye!", C_RED)
                 return
+            # Drain background output while idle — reprint ready if something appeared
+            if drain_output():
+                _show_ready()
 
         audio = record_audio()
         if audio is None or len(audio) < SAMPLE_RATE * 0.3:
-            print("  Too short, skipped.")
+            cprint("Too short, skipped.", C_DIM, indent=True)
             continue
 
         duration = len(audio) / SAMPLE_RATE
-        print(f"  Recorded {duration:.1f}s of audio.")
+        cprint(f"Recorded {duration:.1f}s of audio.", C_DIM, indent=True)
 
+        # Write wav for transcription
         tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         with wave.open(tmp.name, 'w') as wf:
             wf.setnchannels(CHANNELS)
@@ -63,34 +136,18 @@ def main():
             audio_int16 = (audio * 32767).astype(np.int16)
             wf.writeframes(audio_int16.tobytes())
 
-        print(f"  Transcribing with {MODEL_SIZE} (this may take a while)...")
-        t0 = time.time()
-        segments, info = model.transcribe(tmp.name, language='en',
-                                           beam_size=5, best_of=5,
-                                           vad_filter=True)
-        text_parts = [seg.text.strip() for seg in segments]
-        text = ' '.join(text_parts)
-        elapsed = time.time() - t0
+        # Ask for filename (transcription hasn't started yet but will run
+        # concurrently once submitted — the prompt is quick)
+        filepath = prompt_filename()
 
-        os.unlink(tmp.name)
-
-        if not text.strip():
-            print("  (no speech detected)")
-            continue
-
-        print(f"\n  === TRANSCRIPTION ({elapsed:.1f}s, {duration:.1f}s audio) ===")
-        print(f"  {text}")
-        print(f"  {'=' * 50}")
-
-        copy_to_clipboard(text)
-        print("  Copied to clipboard.")
-
-        fpath = save_to_file(text)
-        print(f"  Saved to {fpath}")
+        # Submit to background
+        _adjust_pending(1)
+        cprint("Transcription queued in background...", C_DIM, indent=True)
+        executor.submit(_transcribe_job, model, tmp.name, duration, filepath)
 
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print("\nBye!")
+        cprint("\nBye!", C_RED)
