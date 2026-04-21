@@ -18,8 +18,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stt_common import (get_key_nonblocking, record_audio, copy_to_clipboard,
-                         save_to_file, prompt_filename, cprint, queue_print,
-                         drain_output, has_pending_output,
+                         save_to_file, save_audio, prompt_filename, mic_check,
+                         cprint, queue_print, drain_output, has_pending_output,
                          SAMPLE_RATE, CHANNELS,
                          C_GREEN, C_YELLOW, C_RED, C_CYAN, C_DIM, C_TGREEN)
 
@@ -54,6 +54,9 @@ def _show_ready():
 def _transcribe_job(model, wav_path, duration, filepath):
     """Runs in a background thread: transcribe, save, queue output."""
     try:
+        # Save audio alongside transcript immediately (before transcription)
+        audio_path = save_audio(wav_path, filepath)
+
         t0 = time.time()
         segments, info = model.transcribe(wav_path, language='en',
                                            beam_size=1, best_of=1,
@@ -65,7 +68,7 @@ def _transcribe_job(model, wav_path, duration, filepath):
         os.unlink(wav_path)
 
         if not text.strip():
-            queue_print("(no speech detected)", C_DIM, indent=True)
+            queue_print(f"(no speech detected — audio saved to {audio_path})", C_DIM, indent=True)
             return
 
         ratio = elapsed / duration if duration > 0 else 0
@@ -97,6 +100,17 @@ def main():
     cprint("  Press SPACE/d/ESC to stop recording", C_CYAN)
     cprint("  Press Ctrl+C or 'q' (when idle) to quit", C_CYAN)
     cprint("=" * 55, C_CYAN)
+    print()
+
+    if not mic_check():
+        cprint("Continue anyway? (y/n)", C_RED)
+        while True:
+            key = get_key_nonblocking(0.1)
+            if key in ('y', 'Y', ' '):
+                break
+            if key in ('n', 'N', 'q', 'Q', '\x03', 'ESC'):
+                cprint("Bye!", C_RED)
+                return
 
     executor = ThreadPoolExecutor(max_workers=1)
 

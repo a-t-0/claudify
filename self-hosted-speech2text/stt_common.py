@@ -4,6 +4,7 @@ Shared utilities for both STT variants: file saving, clipboard, key input, color
 
 import sys
 import os
+import shutil
 import subprocess
 import termios
 import tty
@@ -89,6 +90,63 @@ def get_key_nonblocking(timeout=0.05):
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     return None
+
+
+def mic_check():
+    """
+    Quick mic check at startup: record 3 seconds, verify signal level.
+    Returns True if mic seems OK, False if silent/too quiet.
+    """
+    MIC_CHECK_SECS = 3
+    MIN_RMS = 0.005       # ~-46 dBFS — anything below is likely dead mic
+    GOOD_RMS = 0.02       # ~-34 dBFS — comfortably above noise floor
+
+    cprint("Mic check — make a sound (clap, tap, speak)...", C_YELLOW)
+
+    chunks = []
+
+    def callback(indata, frames, time_info, status):
+        chunks.append(indata.copy())
+
+    stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                            dtype='float32', callback=callback)
+    stream.start()
+
+    # Show a live level bar for MIC_CHECK_SECS
+    import time as _time
+    deadline = _time.monotonic() + MIC_CHECK_SECS
+    peak_rms = 0.0
+    while _time.monotonic() < deadline:
+        _time.sleep(0.1)
+        if chunks:
+            recent = np.concatenate(chunks[-10:], axis=0).flatten()
+            rms = float(np.sqrt(np.mean(recent ** 2)))
+            peak_rms = max(peak_rms, rms)
+            # 40-char bar, scaled so 0.1 RMS = full bar
+            bar_len = min(int(rms / 0.1 * 40), 40)
+            bar = "█" * bar_len + "░" * (40 - bar_len)
+            if rms >= GOOD_RMS:
+                color = C_GREEN
+            elif rms >= MIN_RMS:
+                color = C_YELLOW
+            else:
+                color = C_RED
+            print(f"\r{color}  [{bar}] {rms:.4f}{C_RESET}", end="", flush=True)
+
+    stream.stop()
+    stream.close()
+    print()  # newline after the bar
+
+    if peak_rms < MIN_RMS:
+        cprint("Mic appears silent or disconnected!", C_RED)
+        cprint(f"Peak level: {peak_rms:.4f} (need >{MIN_RMS:.3f})", C_RED)
+        return False
+    elif peak_rms < GOOD_RMS:
+        cprint(f"Mic is quiet (peak {peak_rms:.4f}) — consider raising mic volume.", C_YELLOW)
+        return True
+    else:
+        cprint(f"Mic OK (peak {peak_rms:.4f})", C_GREEN)
+        return True
 
 
 def record_audio():
@@ -181,6 +239,14 @@ def prompt_filename():
         raw = ""
 
     return build_filepath(raw)
+
+
+def save_audio(wav_path, filepath):
+    """Copy the recorded wav alongside the transcript (same name, .wav extension)."""
+    audio_path = os.path.splitext(filepath)[0] + '.wav'
+    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+    shutil.copy2(wav_path, audio_path)
+    return audio_path
 
 
 def save_to_file(text, filepath):
